@@ -3,24 +3,21 @@ import random
 import csv
 import io
 import smtplib
+import json
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Body
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordRequestForm
 import asyncpg
 
 from api.database import db
 from api.models import UserCreate, UserLogin, Token, MarkEntry, EnrollmentEntry, PasswordUpdate
-from api.security import get_password_hash, verify_password, create_access_token
+from api.security import get_password_hash, verify_password, create_access_token, get_current_user
 from api.dependencies import require_developer_role, require_teacher_role, require_student_role
-from fastapi import APIRouter, Depends, HTTPException, Body
-from typing import List, Dict, Any
-from . import database, security
-from fastapi.security import OAuth2PasswordRequestForm
 
 router = APIRouter()
 
@@ -32,8 +29,8 @@ router = APIRouter()
 async def register_user(user: UserCreate):
     safe_email = str(user.email)
     
-    # 1. Check if Username is already taken
-    existing_user = await db.pool.fetchrow("SELECT id FROM users WHERE username = $1", user.username)
+    # 1. Check if Username is already taken (Case-insensitive)
+    existing_user = await db.pool.fetchrow("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", user.username)
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already taken. Please choose another.")
 
@@ -69,13 +66,12 @@ async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
         )
         
         # Verify user exists and password is correct
-        if not user_record or not security.verify_password(form_data.password, user_record['password_hash']):
+        if not user_record or not verify_password(form_data.password, user_record['password_hash']):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
         # CRITICAL: Create the token using the user's EMAIL as the 'sub'
-        # This matches exactly what get_current_user in security.py expects for Cloud Syncing!
         token_data = {"sub": user_record['email'], "role": user_record['role']}
-        access_token = security.create_access_token(data=token_data)
+        access_token = create_access_token(data=token_data)
 
         # Return the token AND the user's profile details back to the React frontend
         return {
@@ -87,7 +83,7 @@ async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
         }
         
     except HTTPException:
-        raise  # Pass standard HTTP exceptions through cleanly
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
@@ -267,7 +263,6 @@ async def export_students_csv(current_user: dict = Depends(require_teacher_role)
 # REAL EMAIL PASSWORD RECOVERY ENGINE
 # ---------------------------------------------------------
 
-# Temporary in-memory store for OTPs
 OTP_STORE = {}
 
 class OTPRequest(BaseModel):
@@ -295,7 +290,6 @@ def send_real_email(receiver_email: str, code: str):
     msg['From'] = f"UniAnalytics Security <{sender_email}>"
     msg['To'] = receiver_email
 
-    # THE FIX: Adjusted font-size (24px), padding, and added 'display: inline-block' for perfect mobile rendering
     html = f"""
     <html>
       <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f4f9; padding: 20px; margin: 0;">
@@ -328,22 +322,18 @@ def send_real_email(receiver_email: str, code: str):
 
 @router.post("/request-otp")
 async def request_otp(req: OTPRequest):
-    # 1. Verify the email actually exists in the database
     user = await db.pool.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
     if not user:
         raise HTTPException(status_code=404, detail="Email not found in system.")
     
-    # 2. Generate a secure 6-digit code
     code = str(random.randint(100000, 999999))
     OTP_STORE[req.email] = {
         "code": code,
         "expiry": datetime.now() + timedelta(minutes=10)
     }
     
-    # 3. Fire the email
     success = send_real_email(req.email, code)
     if not success:
-        # Fallback terminal print in case your .env isn't loaded properly
         print(f"--- FALLBACK: OTP FOR {req.email} IS: {code} ---")
         
     return {"message": "Secure OTP processing completed."}
@@ -369,16 +359,13 @@ async def reset_password(req: PasswordReset):
     if not record or record["code"] != req.code:
         raise HTTPException(status_code=400, detail="Unauthorized password reset attempt.")
         
-    # Hash the new password securely
     hashed_pwd = get_password_hash(req.new_password)
     
-    # Update the database
     await db.pool.execute(
         "UPDATE users SET password_hash = $1 WHERE email = $2", 
         hashed_pwd, req.email
     )
     
-    # Destroy the OTP so it can't be used again
     del OTP_STORE[req.email]
     
     return {"message": "Password successfully updated."}
@@ -386,14 +373,11 @@ async def reset_password(req: PasswordReset):
 @router.delete("/user")
 async def delete_user(current_user: dict = Depends(require_teacher_role)):
     try:
-        # In our upgraded token, the identifier is the email, not the ID.
-        # Depending on how require_teacher_role is written, it might return 'email' or 'sub'
         user_email = current_user.get("email") or current_user.get("sub")
         
         if not user_email:
             raise HTTPException(status_code=401, detail="Invalid user token context.")
 
-        # Physically delete the user from the PostgreSQL database using their email
         await db.pool.execute("DELETE FROM users WHERE email = $1", user_email)
         
         return {"status": "success", "message": "Account permanently wiped from database."}
@@ -402,23 +386,21 @@ async def delete_user(current_user: dict = Depends(require_teacher_role)):
     
 @router.put("/user/password")
 async def update_password(payload: PasswordUpdate, current_user: dict = Depends(require_teacher_role)):
-    user_id = current_user.get("sub")
+    user_email = current_user.get("email") or current_user.get("sub")
     
     try:
-        # 1. Fetch the user's current hashed password from the database
-        user_record = await db.pool.fetchrow("SELECT password_hash FROM users WHERE id = $1::uuid", user_id)
+        # THE FIX: Updated to search by email instead of ID
+        user_record = await db.pool.fetchrow("SELECT password_hash FROM users WHERE email = $1", user_email)
         if not user_record:
             raise HTTPException(status_code=404, detail="User not found.")
             
-        # 2. Verify the old password matches what they typed
         if not verify_password(payload.old_password, user_record['password_hash']):
             raise HTTPException(status_code=400, detail="Incorrect current password.")
             
-        # 3. Hash the new password and update the database
         hashed_new_pwd = get_password_hash(payload.new_password)
         await db.pool.execute(
-            "UPDATE users SET password_hash = $1 WHERE id = $2::uuid",
-            hashed_new_pwd, user_id
+            "UPDATE users SET password_hash = $1 WHERE email = $2",
+            hashed_new_pwd, user_email
         )
         
         return {"message": "Password updated successfully."}
@@ -427,19 +409,21 @@ async def update_password(payload: PasswordUpdate, current_user: dict = Depends(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+# ---------------------------------------------------------
+# MASTER CLOUD DATA SYNC
+# ---------------------------------------------------------
+
 @router.post("/sync-master-data")
 async def sync_master_data(
     data: list = Body(...), 
-    current_user: dict = Depends(security.get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
     """Saves massive JSON to Neon DB securely"""
-    conn = await database.get_db_connection()
     try:
-        import json
         json_data = json.dumps(data)
         
-        # Updated to search by email instead of ID
-        await conn.execute('''
+        # THE FIX: Using db.pool instead of creating a new unmanaged connection
+        await db.pool.execute('''
             UPDATE users 
             SET master_data = $1 
             WHERE email = $2
@@ -448,22 +432,18 @@ async def sync_master_data(
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await conn.close()
 
 @router.get("/get-master-data")
-async def get_master_data(current_user: dict = Depends(security.get_current_user)):
+async def get_master_data(current_user: dict = Depends(get_current_user)):
     """Pulls data from Neon DB on login"""
-    conn = await database.get_db_connection()
     try:
-        # Updated to search by email instead of ID
-        row = await conn.fetchrow('''
+        # THE FIX: Using db.pool
+        row = await db.pool.fetchrow('''
             SELECT master_data FROM users WHERE email = $1
         ''', current_user['email'])
         
         if row and row['master_data']:
-            import json
             return json.loads(row['master_data'])
         return []
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
