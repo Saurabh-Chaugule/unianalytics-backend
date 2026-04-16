@@ -59,30 +59,37 @@ async def register_user(user: UserCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database insert error: {str(e)}")
 
-# UPDATED: Now fetches username and dob to send back to the frontend store
 @router.post("/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    conn = await database.get_db_connection()
+async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
     try:
-        # Search for the user by email (form_data.username contains the email)
-        user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", form_data.username)
+        # THE FIX: Added 'email' to the SELECT statement
+        user_record = await db.pool.fetchrow(
+            "SELECT id, email, username, password_hash, role, dob FROM users WHERE email = $1", 
+            str(form_data.username)  # OAuth2 maps the email field to 'username'
+        )
         
-        if not user or not security.verify_password(form_data.password, user['hashed_password']):
-            raise HTTPException(status_code=401, detail="Incorrect email or password")
-            
-        # Create the token
-        access_token = security.create_access_token(data={"sub": user['email'], "role": user['role']})
-        
-        # --- THE FIX: Return all user details back to React ---
+        if not user_record:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        if not verify_password(form_data.password, user_record['password_hash']):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        # THE CRITICAL FIX: Set "sub" to the user's EMAIL, not the ID!
+        # This matches what security.py is looking for.
+        token_data = {"sub": user_record['email'], "role": user_record['role']}
+        access_token = create_access_token(data=token_data)
+
         return {
             "access_token": access_token, 
-            "token_type": "bearer",
-            "name": user['first_name'], # Or however you store their username in your DB
-            "role": user['role'],
-            "dob": user.get('dob', 'Not Provided') # Use .get() in case the column is null
+            "token_type": "bearer", 
+            "role": user_record['role'],
+            "name": user_record['username'], # Send username back as 'name' for the dashboard
+            "dob": str(user_record['dob']) if user_record['dob'] else "Not Provided"
         }
-    finally:
-        await conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
 # ---------------------------------------------------------
 # SYSTEM ANALYTICS
