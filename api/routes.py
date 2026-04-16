@@ -20,6 +20,7 @@ from api.dependencies import require_developer_role, require_teacher_role, requi
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import List, Dict, Any
 from . import database, security
+from fastapi.security import OAuth2PasswordRequestForm
 
 router = APIRouter()
 
@@ -59,34 +60,29 @@ async def register_user(user: UserCreate):
         raise HTTPException(status_code=500, detail=f"Database insert error: {str(e)}")
 
 # UPDATED: Now fetches username and dob to send back to the frontend store
-@router.post("/login", response_model=Token)
-async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
+@router.post("/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = await database.get_db_connection()
     try:
-        user_record = await db.pool.fetchrow(
-            "SELECT id, username, password_hash, role, dob FROM users WHERE email = $1", 
-            str(form_data.username)  # OAuth2 maps the email field to 'username'
-        )
+        # Search for the user by email (form_data.username contains the email)
+        user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", form_data.username)
         
-        if not user_record:
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-        if not verify_password(form_data.password, user_record['password_hash']):
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-        token_data = {"sub": str(user_record['id']), "role": user_record['role']}
-        access_token = create_access_token(data=token_data)
-
+        if not user or not security.verify_password(form_data.password, user['hashed_password']):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+            
+        # Create the token
+        access_token = security.create_access_token(data={"sub": user['email'], "role": user['role']})
+        
+        # --- THE FIX: Return all user details back to React ---
         return {
             "access_token": access_token, 
-            "token_type": "bearer", 
-            "role": user_record['role'],
-            "name": user_record['username'], # Send username back as 'name' for the dashboard
-            "dob": user_record['dob']
+            "token_type": "bearer",
+            "name": user['first_name'], # Or however you store their username in your DB
+            "role": user['role'],
+            "dob": user.get('dob', 'Not Provided') # Use .get() in case the column is null
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
+    finally:
+        await conn.close()
 
 # ---------------------------------------------------------
 # SYSTEM ANALYTICS
@@ -419,44 +415,38 @@ async def update_password(payload: PasswordUpdate, current_user: dict = Depends(
 
 @router.post("/sync-master-data")
 async def sync_master_data(
-    data: List[Dict[str, Any]] = Body(...), 
+    data: list = Body(...), 
     current_user: dict = Depends(security.get_current_user)
 ):
-    """
-    Receives the massive JSON payload from the React frontend 
-    and saves it securely to the cloud database for this specific user.
-    """
+    """Saves massive JSON to Neon DB securely"""
     conn = await database.get_db_connection()
     try:
-        # Convert the complex Python dictionary into a JSON string for PostgreSQL
         import json
         json_data = json.dumps(data)
         
-        # Update the user's master_data field in the cloud database
+        # Updated to search by email instead of ID
         await conn.execute('''
             UPDATE users 
             SET master_data = $1 
-            WHERE id = $2
-        ''', json_data, current_user['id'])
+            WHERE email = $2
+        ''', json_data, current_user['email'])
         
-        return {"status": "success", "message": "Cloud database updated successfully"}
+        return {"status": "success"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         await conn.close()
 
 @router.get("/get-master-data")
 async def get_master_data(current_user: dict = Depends(security.get_current_user)):
-    """
-    Pulls the user's latest data from the cloud database when they log in.
-    """
+    """Pulls data from Neon DB on login"""
     conn = await database.get_db_connection()
     try:
+        # Updated to search by email instead of ID
         row = await conn.fetchrow('''
-            SELECT master_data FROM users WHERE id = $1
-        ''', current_user['id'])
+            SELECT master_data FROM users WHERE email = $1
+        ''', current_user['email'])
         
-        # If they have data, return it. If not, return an empty array.
         if row and row['master_data']:
             import json
             return json.loads(row['master_data'])
