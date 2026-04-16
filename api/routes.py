@@ -17,6 +17,9 @@ from api.database import db
 from api.models import UserCreate, UserLogin, Token, MarkEntry, EnrollmentEntry, PasswordUpdate
 from api.security import get_password_hash, verify_password, create_access_token
 from api.dependencies import require_developer_role, require_teacher_role, require_student_role
+from fastapi import APIRouter, Depends, HTTPException, Body
+from typing import List, Dict, Any
+from . import database, security
 
 router = APIRouter()
 
@@ -413,3 +416,50 @@ async def update_password(payload: PasswordUpdate, current_user: dict = Depends(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.post("/sync-master-data")
+async def sync_master_data(
+    data: List[Dict[str, Any]] = Body(...), 
+    current_user: dict = Depends(security.get_current_user)
+):
+    """
+    Receives the massive JSON payload from the React frontend 
+    and saves it securely to the cloud database for this specific user.
+    """
+    conn = await database.get_db_connection()
+    try:
+        # Convert the complex Python dictionary into a JSON string for PostgreSQL
+        import json
+        json_data = json.dumps(data)
+        
+        # Update the user's master_data field in the cloud database
+        await conn.execute('''
+            UPDATE users 
+            SET master_data = $1 
+            WHERE id = $2
+        ''', json_data, current_user['id'])
+        
+        return {"status": "success", "message": "Cloud database updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    finally:
+        await conn.close()
+
+@router.get("/get-master-data")
+async def get_master_data(current_user: dict = Depends(security.get_current_user)):
+    """
+    Pulls the user's latest data from the cloud database when they log in.
+    """
+    conn = await database.get_db_connection()
+    try:
+        row = await conn.fetchrow('''
+            SELECT master_data FROM users WHERE id = $1
+        ''', current_user['id'])
+        
+        # If they have data, return it. If not, return an empty array.
+        if row and row['master_data']:
+            import json
+            return json.loads(row['master_data'])
+        return []
+    finally:
+        await conn.close()
