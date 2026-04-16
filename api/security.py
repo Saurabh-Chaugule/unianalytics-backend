@@ -2,11 +2,16 @@ import os
 from datetime import datetime, timedelta, timezone
 import bcrypt
 import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 
 # Retrieve the secret key from the .env file
 SECRET_KEY = os.getenv("SECRET_KEY", "fallback_secret_do_not_use_in_prod")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # Token valid for 24 hours
+
+# Tells FastAPI where to look for the token in the headers
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/login")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Check if the provided password matches the stored bcrypt hash."""
@@ -40,3 +45,29 @@ def decode_access_token(token: str):
         return payload
     except jwt.PyJWTError:
         return None
+
+# --- NEW: Route Protection Dependency ---
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """
+    Validates the token from the incoming request.
+    If valid, returns a dictionary containing the user's email.
+    If invalid or expired, throws an HTTP 401 error.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        # Decode the token using PyJWT
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # 'sub' (subject) usually contains the user identifier (email in our case)
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+            
+        return {"email": email}
+        
+    except jwt.PyJWTError:
+        raise credentials_exception
