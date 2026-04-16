@@ -386,10 +386,17 @@ async def reset_password(req: PasswordReset):
 @router.delete("/user")
 async def delete_user(current_user: dict = Depends(require_teacher_role)):
     try:
-        user_id = current_user.get("sub")
-        # 1. Physically delete the user from the PostgreSQL database using their unique ID
-        await db.pool.execute("DELETE FROM users WHERE id = $1::uuid", user_id)
-        return {"message": "Account permanently wiped from database."}
+        # In our upgraded token, the identifier is the email, not the ID.
+        # Depending on how require_teacher_role is written, it might return 'email' or 'sub'
+        user_email = current_user.get("email") or current_user.get("sub")
+        
+        if not user_email:
+            raise HTTPException(status_code=401, detail="Invalid user token context.")
+
+        # Physically delete the user from the PostgreSQL database using their email
+        await db.pool.execute("DELETE FROM users WHERE email = $1", user_email)
+        
+        return {"status": "success", "message": "Account permanently wiped from database."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
     
