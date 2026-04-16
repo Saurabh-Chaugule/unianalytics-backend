@@ -62,32 +62,32 @@ async def register_user(user: UserCreate):
 @router.post("/login")
 async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
     try:
-        # THE FIX: Added 'email' to the SELECT statement
+        # Fetch the user by email, grabbing ALL necessary columns
         user_record = await db.pool.fetchrow(
             "SELECT id, email, username, password_hash, role, dob FROM users WHERE email = $1", 
             str(form_data.username)  # OAuth2 maps the email field to 'username'
         )
         
-        if not user_record:
+        # Verify user exists and password is correct
+        if not user_record or not security.verify_password(form_data.password, user_record['password_hash']):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-        if not verify_password(form_data.password, user_record['password_hash']):
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-        # THE CRITICAL FIX: Set "sub" to the user's EMAIL, not the ID!
-        # This matches what security.py is looking for.
+        # CRITICAL: Create the token using the user's EMAIL as the 'sub'
+        # This matches exactly what get_current_user in security.py expects for Cloud Syncing!
         token_data = {"sub": user_record['email'], "role": user_record['role']}
-        access_token = create_access_token(data=token_data)
+        access_token = security.create_access_token(data=token_data)
 
+        # Return the token AND the user's profile details back to the React frontend
         return {
             "access_token": access_token, 
             "token_type": "bearer", 
             "role": user_record['role'],
-            "name": user_record['username'], # Send username back as 'name' for the dashboard
+            "name": user_record['username'], # Sends 'username' to React as 'name'
             "dob": str(user_record['dob']) if user_record['dob'] else "Not Provided"
         }
+        
     except HTTPException:
-        raise
+        raise  # Pass standard HTTP exceptions through cleanly
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
