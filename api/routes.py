@@ -311,7 +311,9 @@ def send_real_email(receiver_email: str, code: str):
     msg.attach(MIMEText(html, "html"))
 
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        # THE FIX: Force IPv4 by binding to 0.0.0.0 and add a timeout.
+        # This prevents the Render container from crashing on IPv6 (Errno 101)
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15, source_address=('0.0.0.0', 0)) as server:
             server.login(sender_email, sender_password)
             server.send_message(msg)
         print(f"✅ Successfully sent OTP email to {receiver_email}")
