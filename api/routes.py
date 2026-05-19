@@ -4,6 +4,7 @@ import csv
 import io
 import smtplib
 import json
+import socket
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,6 +20,20 @@ from api.models import UserCreate, UserLogin, Token, MarkEntry, EnrollmentEntry,
 from api.security import get_password_hash, verify_password, create_access_token, get_current_user
 from api.dependencies import require_developer_role, require_teacher_role, require_student_role
 
+# =========================================================================
+# THE ULTIMATE RENDER NETWORK FIX: FORCE IPv4
+# Google DNS returns IPv6 addresses for smtp.gmail.com, but Render's free 
+# tier Linux containers DO NOT support IPv6 outbound traffic. This causes
+# the instant "[Errno 101] Network is unreachable" crash. 
+# This code intercepts Python's networking and forces it to strictly use IPv4.
+# =========================================================================
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    responses = old_getaddrinfo(*args, **kwargs)
+    return [res for res in responses if res[0] == socket.AF_INET]
+socket.getaddrinfo = new_getaddrinfo
+# =========================================================================
+
 router = APIRouter()
 
 # ---------------------------------------------------------
@@ -29,14 +44,12 @@ router = APIRouter()
 async def register_user(user: UserCreate):
     safe_email = str(user.email)
     
-    # 1. Check if Username is already taken (Case-insensitive)
     existing_user = await db.pool.fetchrow("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", user.username)
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already taken. Please choose another.")
 
     hashed_pwd = get_password_hash(user.password)
 
-    # 2. Insert into database using the new username column
     insert_query = """
         INSERT INTO users (email, password_hash, role, username, dob)
         VALUES ($1, $2, 'teacher', $3, $4)
@@ -59,26 +72,22 @@ async def register_user(user: UserCreate):
 @router.post("/login")
 async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
     try:
-        # Fetch the user by email, grabbing ALL necessary columns
         user_record = await db.pool.fetchrow(
             "SELECT id, email, username, password_hash, role, dob FROM users WHERE email = $1", 
-            str(form_data.username)  # OAuth2 maps the email field to 'username'
+            str(form_data.username) 
         )
         
-        # Verify user exists and password is correct
         if not user_record or not verify_password(form_data.password, user_record['password_hash']):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-        # CRITICAL: Create the token using the user's EMAIL as the 'sub'
         token_data = {"sub": user_record['email'], "role": user_record['role']}
         access_token = create_access_token(data=token_data)
 
-        # Return the token AND the user's profile details back to the React frontend
         return {
             "access_token": access_token, 
             "token_type": "bearer", 
             "role": user_record['role'],
-            "name": user_record['username'], # Sends 'username' to React as 'name'
+            "name": user_record['username'],
             "dob": str(user_record['dob']) if user_record['dob'] else "Not Provided"
         }
         
@@ -311,10 +320,10 @@ def send_real_email(receiver_email: str, code: str):
     msg.attach(MIMEText(html, "html"))
 
     try:
-        # THE ULTIMATE FIX: Port 587 with STARTTLS bypasses strict cloud firewalls
+        # THE FIX: Switched to Port 587 and starttls() to bypass strict cloud SMTP firewalls
         with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as server:
-            server.ehlo() # Identify with the server
-            server.starttls() # Upgrade the connection to secure encrypted TLS
+            server.ehlo()
+            server.starttls()
             server.login(sender_email, sender_password)
             server.send_message(msg)
         print(f"✅ Successfully sent OTP email to {receiver_email}")
@@ -325,22 +334,17 @@ def send_real_email(receiver_email: str, code: str):
 
 @router.post("/request-otp")
 async def request_otp(req: OTPRequest):
-    # 1. Verify the email actually exists in the database
     user = await db.pool.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
     if not user:
         raise HTTPException(status_code=404, detail="Email not found in system.")
     
-    # 2. Generate a secure 6-digit code
     code = str(random.randint(100000, 999999))
     OTP_STORE[req.email] = {
         "code": code,
         "expiry": datetime.now() + timedelta(minutes=10)
     }
     
-    # 3. Fire the email
     success = send_real_email(req.email, code)
-    
-    # THE FIX: If email fails, delete the OTP and throw a hard error to the frontend!
     if not success:
         del OTP_STORE[req.email]
         raise HTTPException(status_code=500, detail="Mail server configuration error. SMTP dispatch failed.")
@@ -398,7 +402,6 @@ async def update_password(payload: PasswordUpdate, current_user: dict = Depends(
     user_email = current_user.get("email") or current_user.get("sub")
     
     try:
-        # THE FIX: Updated to search by email instead of ID
         user_record = await db.pool.fetchrow("SELECT password_hash FROM users WHERE email = $1", user_email)
         if not user_record:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -427,11 +430,8 @@ async def sync_master_data(
     data: list = Body(...), 
     current_user: dict = Depends(get_current_user)
 ):
-    """Saves massive JSON to Neon DB securely"""
     try:
         json_data = json.dumps(data)
-        
-        # THE FIX: Using db.pool instead of creating a new unmanaged connection
         await db.pool.execute('''
             UPDATE users 
             SET master_data = $1 
@@ -444,9 +444,7 @@ async def sync_master_data(
 
 @router.get("/get-master-data")
 async def get_master_data(current_user: dict = Depends(get_current_user)):
-    """Pulls data from Neon DB on login"""
     try:
-        # THE FIX: Using db.pool
         row = await db.pool.fetchrow('''
             SELECT master_data FROM users WHERE email = $1
         ''', current_user['email'])
