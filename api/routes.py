@@ -322,19 +322,25 @@ def send_real_email(receiver_email: str, code: str):
 
 @router.post("/request-otp")
 async def request_otp(req: OTPRequest):
+    # 1. Verify the email actually exists in the database
     user = await db.pool.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
     if not user:
         raise HTTPException(status_code=404, detail="Email not found in system.")
     
+    # 2. Generate a secure 6-digit code
     code = str(random.randint(100000, 999999))
     OTP_STORE[req.email] = {
         "code": code,
         "expiry": datetime.now() + timedelta(minutes=10)
     }
     
+    # 3. Fire the email
     success = send_real_email(req.email, code)
+    
+    # THE FIX: If email fails, delete the OTP and throw a hard error to the frontend!
     if not success:
-        print(f"--- FALLBACK: OTP FOR {req.email} IS: {code} ---")
+        del OTP_STORE[req.email]
+        raise HTTPException(status_code=500, detail="Mail server configuration error. SMTP dispatch failed.")
         
     return {"message": "Secure OTP processing completed."}
 
