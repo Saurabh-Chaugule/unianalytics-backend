@@ -18,7 +18,8 @@ import asyncpg
 from api.database import db
 from api.models import UserCreate, UserLogin, Token, MarkEntry, EnrollmentEntry, PasswordUpdate
 from api.security import get_password_hash, verify_password, create_access_token, get_current_user
-from api.dependencies import require_developer_role, require_teacher_role, require_student_role
+from api.dependencies import require_developer_role, require_teacher_role, require_student_role 
+import socket
 
 # =========================================================================
 # THE ULTIMATE RENDER NETWORK FIX: FORCE IPv4
@@ -290,29 +291,22 @@ def send_real_email(receiver_email: str, code: str):
     sender_email = os.getenv("EMAIL_SENDER")
     sender_password = os.getenv("EMAIL_PASSWORD")
     
-    if not sender_email or not sender_password:
-        print("❌ EMAIL CREDENTIALS MISSING IN .ENV FILE")
-        return False
-        
+    # Brevo Relay Settings
+    smtp_host = "smtp-relay.brevo.com"
+    smtp_port = 587
+    
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = 'UniAnalytics Security: Password Reset Verification Code'
-    msg['From'] = f"UniAnalytics Security <{sender_email}>"
+    msg['Subject'] = 'UniAnalytics Security: Password Reset'
+    msg['From'] = f"UniAnalytics <{sender_email}>"
     msg['To'] = receiver_email
 
     html = f"""
     <html>
-      <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f4f9; padding: 20px; margin: 0;">
-        <div style="max-width: 500px; margin: 0 auto; background-color: #ffffff; padding: 30px 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); border-top: 5px solid #4F46E5;">
-          <h2 style="color: #1e293b; margin-top: 0; font-size: 20px;">Account Recovery</h2>
-          <p style="color: #475569; font-size: 15px; line-height: 1.5;">Enter the following password reset code to verify your identity:</p>
-          
-          <div style="margin: 30px 0; text-align: center;">
-            <span style="display: inline-block; font-size: 26px; font-weight: 800; letter-spacing: 4px; color: #4F46E5; background-color: #e0e7ff; padding: 12px 20px; border-radius: 8px;">{code}</span>
-          </div>
-          
-          <p style="color: #475569; font-size: 13px; line-height: 1.5;">This code will securely expire in <strong>10 minutes</strong>. If you did not request this code, you can safely ignore this email.</p>
-          <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 25px 0;" />
-          <p style="color: #94a3b8; font-size: 11px; text-align: center;">UniAnalytics Security Systems &copy; {datetime.now().year}</p>
+      <body style="font-family: sans-serif; padding: 20px;">
+        <div style="background: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #ddd;">
+          <h2>Account Recovery</h2>
+          <p>Your verification code is: <strong>{code}</strong></p>
+          <p>Expires in 10 minutes.</p>
         </div>
       </body>
     </html>
@@ -320,8 +314,9 @@ def send_real_email(receiver_email: str, code: str):
     msg.attach(MIMEText(html, "html"))
 
     try:
-        # THE FIX: Switched to Port 587 and starttls() to bypass strict cloud SMTP firewalls
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as server:
+        # THE FIX: We use a specific connection setup that forces IPv4 and STARTTLS
+        # The 'source_address' forces the use of IPv4 (AF_INET) to bypass the unreachable error.
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
             server.ehlo()
             server.starttls()
             server.login(sender_email, sender_password)
@@ -329,7 +324,7 @@ def send_real_email(receiver_email: str, code: str):
         print(f"✅ Successfully sent OTP email to {receiver_email}")
         return True
     except Exception as e:
-        print(f"❌ CRITICAL EMAIL ERROR: {e}")
+        print(f"❌ SMTP RELAY ERROR: {e}")
         return False
 
 @router.post("/request-otp")
