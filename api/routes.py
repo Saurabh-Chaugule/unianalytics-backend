@@ -2,12 +2,9 @@ import os
 import random
 import csv
 import io
-import smtplib
 import json
-import socket
+import urllib.request
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Body
@@ -18,22 +15,7 @@ import asyncpg
 from api.database import db
 from api.models import UserCreate, UserLogin, Token, MarkEntry, EnrollmentEntry, PasswordUpdate
 from api.security import get_password_hash, verify_password, create_access_token, get_current_user
-from api.dependencies import require_developer_role, require_teacher_role, require_student_role 
-import socket
-
-# =========================================================================
-# THE ULTIMATE RENDER NETWORK FIX: FORCE IPv4
-# Google DNS returns IPv6 addresses for smtp.gmail.com, but Render's free 
-# tier Linux containers DO NOT support IPv6 outbound traffic. This causes
-# the instant "[Errno 101] Network is unreachable" crash. 
-# This code intercepts Python's networking and forces it to strictly use IPv4.
-# =========================================================================
-old_getaddrinfo = socket.getaddrinfo
-def new_getaddrinfo(*args, **kwargs):
-    responses = old_getaddrinfo(*args, **kwargs)
-    return [res for res in responses if res[0] == socket.AF_INET]
-socket.getaddrinfo = new_getaddrinfo
-# =========================================================================
+from api.dependencies import require_developer_role, require_teacher_role, require_student_role
 
 router = APIRouter()
 
@@ -270,7 +252,7 @@ async def export_students_csv(current_user: dict = Depends(require_teacher_role)
         raise HTTPException(status_code=500, detail="Failed to generate CSV export.")
     
 # ---------------------------------------------------------
-# REAL EMAIL PASSWORD RECOVERY ENGINE
+# REAL EMAIL PASSWORD RECOVERY ENGINE (HTTP API BYPASS)
 # ---------------------------------------------------------
 
 OTP_STORE = {}
@@ -289,42 +271,54 @@ class PasswordReset(BaseModel):
 
 def send_real_email(receiver_email: str, code: str):
     sender_email = os.getenv("EMAIL_SENDER")
-    sender_password = os.getenv("EMAIL_PASSWORD")
+    api_key = os.getenv("EMAIL_PASSWORD") # Reading the Brevo API Key
     
-    # Brevo Relay Settings
-    smtp_host = "smtp-relay.brevo.com"
-    smtp_port = 587
+    if not sender_email or not api_key:
+        print("❌ CREDENTIALS MISSING IN .ENV FILE")
+        return False
+        
+    url = "https://api.brevo.com/v3/smtp/email"
     
-    msg = MIMEMultipart("alternative")
-    msg['Subject'] = 'UniAnalytics Security: Password Reset'
-    msg['From'] = f"UniAnalytics <{sender_email}>"
-    msg['To'] = receiver_email
-
-    html = f"""
-    <html>
-      <body style="font-family: sans-serif; padding: 20px;">
-        <div style="background: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #ddd;">
-          <h2>Account Recovery</h2>
-          <p>Your verification code is: <strong>{code}</strong></p>
-          <p>Expires in 10 minutes.</p>
-        </div>
-      </body>
-    </html>
-    """
-    msg.attach(MIMEText(html, "html"))
+    # Formulate the payload for Brevo API
+    payload = {
+        "sender": {"email": sender_email, "name": "UniAnalytics Security"},
+        "to": [{"email": receiver_email}],
+        "subject": "UniAnalytics Security: Password Reset Verification Code",
+        "htmlContent": f"""
+        <html>
+          <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f4f9; padding: 20px; margin: 0;">
+            <div style="max-width: 500px; margin: 0 auto; background-color: #ffffff; padding: 30px 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); border-top: 5px solid #4F46E5;">
+              <h2 style="color: #1e293b; margin-top: 0; font-size: 20px;">Account Recovery</h2>
+              <p style="color: #475569; font-size: 15px; line-height: 1.5;">Enter the following password reset code to verify your identity:</p>
+              
+              <div style="margin: 30px 0; text-align: center;">
+                <span style="display: inline-block; font-size: 26px; font-weight: 800; letter-spacing: 4px; color: #4F46E5; background-color: #e0e7ff; padding: 12px 20px; border-radius: 8px;">{code}</span>
+              </div>
+              
+              <p style="color: #475569; font-size: 13px; line-height: 1.5;">This code will securely expire in <strong>10 minutes</strong>. If you did not request this code, you can safely ignore this email.</p>
+              <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 25px 0;" />
+              <p style="color: #94a3b8; font-size: 11px; text-align: center;">UniAnalytics Security Systems &copy; {datetime.now().year}</p>
+            </div>
+          </body>
+        </html>
+        """
+    }
+    
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json"
+    }
 
     try:
-        # THE FIX: We use a specific connection setup that forces IPv4 and STARTTLS
-        # The 'source_address' forces the use of IPv4 (AF_INET) to bypass the unreachable error.
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-        print(f"✅ Successfully sent OTP email to {receiver_email}")
-        return True
+        # THE FIX: This HTTP Request bypasses the Render SMTP Firewall completely
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as response:
+            print(f"✅ Successfully sent OTP email via HTTP API to {receiver_email}")
+            return True
     except Exception as e:
-        print(f"❌ SMTP RELAY ERROR: {e}")
+        print(f"❌ CRITICAL HTTP API EMAIL ERROR: {e}")
         return False
 
 @router.post("/request-otp")
@@ -342,7 +336,7 @@ async def request_otp(req: OTPRequest):
     success = send_real_email(req.email, code)
     if not success:
         del OTP_STORE[req.email]
-        raise HTTPException(status_code=500, detail="Mail server configuration error. SMTP dispatch failed.")
+        raise HTTPException(status_code=500, detail="Mail server configuration error. API dispatch failed.")
         
     return {"message": "Secure OTP processing completed."}
 
