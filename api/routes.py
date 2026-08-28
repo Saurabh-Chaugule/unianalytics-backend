@@ -4,7 +4,12 @@ import csv
 import io
 import json
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Ensure .env is loaded for email credentials
+load_dotenv()
 
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Body
@@ -271,10 +276,13 @@ class PasswordReset(BaseModel):
 
 def send_real_email(receiver_email: str, code: str):
     sender_email = os.getenv("EMAIL_SENDER")
-    api_key = os.getenv("EMAIL_PASSWORD") # Reading the Brevo API Key
+    api_key = os.getenv("EMAIL_API_KEY") or os.getenv("EMAIL_PASSWORD")  # Check both env var names
+    
+    # Debug logging to identify missing credentials on Render
+    print(f"📧 EMAIL DEBUG: sender_email={'SET' if sender_email else 'MISSING'}, api_key={'SET (length={})'.format(len(api_key)) if api_key else 'MISSING'}")
     
     if not sender_email or not api_key:
-        print("❌ CREDENTIALS MISSING IN .ENV FILE")
+        print("❌ CREDENTIALS MISSING! Set EMAIL_SENDER and EMAIL_API_KEY in Render Environment variables.")
         return False
         
     url = "https://api.brevo.com/v3/smtp/email"
@@ -311,14 +319,21 @@ def send_real_email(receiver_email: str, code: str):
     }
 
     try:
-        # THE FIX: This HTTP Request bypasses the Render SMTP Firewall completely
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=15) as response:
-            print(f"✅ Successfully sent OTP email via HTTP API to {receiver_email}")
+            response_body = response.read().decode("utf-8")
+            print(f"✅ Successfully sent OTP email via Brevo API to {receiver_email}")
+            print(f"   Brevo response: {response_body}")
             return True
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else "No response body"
+        print(f"❌ BREVO API HTTP ERROR {e.code}: {e.reason}")
+        print(f"   Response body: {error_body}")
+        print(f"   This usually means the API key is invalid. Get your key from: https://app.brevo.com/settings/keys/api")
+        return False
     except Exception as e:
-        print(f"❌ CRITICAL HTTP API EMAIL ERROR: {e}")
+        print(f"❌ CRITICAL EMAIL ERROR: {type(e).__name__}: {e}")
         return False
 
 @router.post("/request-otp")
@@ -327,10 +342,21 @@ async def request_otp(req: OTPRequest):
     if not user:
         raise HTTPException(status_code=404, detail="Email not found in system.")
     
+    # Enforcing the 24-hour exact timeline block
+    existing_record = OTP_STORE.get(req.email)
+    if existing_record and "requested_at" in existing_record:
+        seconds_passed = (datetime.now() - existing_record["requested_at"]).total_seconds()
+        if seconds_passed < 86400: # Exactly 24 hours
+            raise HTTPException(
+                status_code=429, 
+                detail="Too many requests , Try again after 24hrs"
+            )
+
     code = str(random.randint(100000, 999999))
     OTP_STORE[req.email] = {
         "code": code,
-        "expiry": datetime.now() + timedelta(minutes=10)
+        "expiry": datetime.now() + timedelta(minutes=10),
+        "requested_at": datetime.now()
     }
     
     success = send_real_email(req.email, code)
@@ -376,15 +402,19 @@ async def reset_password(req: PasswordReset):
 async def delete_user(current_user: dict = Depends(require_teacher_role)):
     try:
         user_email = current_user.get("email") or current_user.get("sub")
-        
         if not user_email:
             raise HTTPException(status_code=401, detail="Invalid user token context.")
 
-        await db.pool.execute("DELETE FROM users WHERE email = $1", user_email)
-        
-        return {"status": "success", "message": "Account permanently wiped from database."}
+        # Wipe execution logic locks the database transaction to prevent race conditions.
+        async with db.pool.acquire() as connection:
+            async with connection.transaction():
+                # Eradicating the user row inherently destroys the JSON master_data 
+                # resolving your persistent data wipe concern
+                await connection.execute("DELETE FROM users WHERE email = $1", user_email)
+
+        return {"status": "success", "message": "Account and all associated cloud data permanently wiped."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete account data: {str(e)}")
     
 @router.put("/user/password")
 async def update_password(payload: PasswordUpdate, current_user: dict = Depends(require_teacher_role)):
